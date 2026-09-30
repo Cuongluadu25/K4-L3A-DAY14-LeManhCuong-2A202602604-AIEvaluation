@@ -266,6 +266,61 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Generator backed by the Gemini API (google-genai SDK).
+
+    Selected when GEMINI_API_KEY is set; mirrors OpenAIGenerator so the
+    retriever, prompt, and trace pipeline stay identical.
+    """
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        from google import genai
+
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.client = genai.Client(api_key=api_key)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        # Free-tier quota is a few requests per minute and the model can be
+        # briefly overloaded; retry 429/503 with backoff so a full benchmark
+        # run completes without manual restarts.
+        max_attempts = 8
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config={
+                        "temperature": 0,
+                        "max_output_tokens": self.max_output_tokens,
+                    },
+                )
+            except Exception as exc:
+                text = str(exc)
+                transient = any(
+                    code in text for code in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "high demand")
+                )
+                if transient and attempt < max_attempts:
+                    time.sleep(20 * attempt)
+                    continue
+                raise
+            answer = (response.text or "").strip()
+            if not answer:
+                raise RuntimeError("Gemini returned an empty answer")
+            return answer
+        raise RuntimeError("Gemini kept returning empty answers")
+
+
+def build_default_generator() -> TextGenerator:
+    """Prefer Gemini when its key is set; otherwise fall back to OpenAI."""
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        return GeminiGenerator()
+    return OpenAIGenerator()
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +354,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else build_default_generator(),
             top_k,
         )
 
